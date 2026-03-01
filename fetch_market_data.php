@@ -10,7 +10,7 @@ $vsCurrency = 'usd';
 $perPage = 250;
 $pages = 2; // TOP500
 
-$logFile = __DIR__ . 'logs/market_data.log';
+$logFile = __DIR__ . '/logs/market_data.log';
 
 $db = [
     'dsn'  => 'mysql:host=localhost;dbname=market_info;charset=utf8mb4',
@@ -21,7 +21,7 @@ $db = [
 // ---------------------------------
 // ログ関数
 // ---------------------------------
-function logMessage($level, $message)
+function logMessage(string $level, string $message): void
 {
     global $logFile;
     $time = date('Y-m-d H:i:s');
@@ -35,7 +35,7 @@ function logMessage($level, $message)
 // ---------------------------------
 // CoinGecko API 取得
 // ---------------------------------
-function fetchTokens($page, $maxRetry = 20)
+function fetchTokens(int $page, int $maxRetry = 20): array
 {
     global $apiUrl, $vsCurrency, $perPage;
 
@@ -50,7 +50,7 @@ function fetchTokens($page, $maxRetry = 20)
     $url = "$apiUrl?$query";
 
     $retry = 0;
-    $wait  = 2; // 初期待機秒
+    $wait  = 2;
 
     while (true) {
         $ch = curl_init($url);
@@ -70,12 +70,10 @@ function fetchTokens($page, $maxRetry = 20)
         $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
-        // 正常
         if ($status === 200) {
             return json_decode($response, true);
         }
 
-        // Rate Limit
         if ($status === 429 && $retry < $maxRetry) {
             $retry++;
             logMessage(
@@ -83,11 +81,10 @@ function fetchTokens($page, $maxRetry = 20)
                 "Rate limit hit (page={$page}). Retry {$retry}/{$maxRetry} after {$wait}s"
             );
             sleep($wait);
-            $wait *= 2; // exponential backoff
+            $wait *= 2;
             continue;
         }
 
-        // その他エラー
         logMessage(
             'ERROR',
             "HTTP {$status} received from CoinGecko (page={$page})"
@@ -95,7 +92,6 @@ function fetchTokens($page, $maxRetry = 20)
         throw new Exception("HTTP {$status}");
     }
 }
-
 
 // ---------------------------------
 // メイン処理
@@ -108,8 +104,8 @@ try {
         $db['user'],
         $db['pass'],
         [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_EMULATE_PREPARES => false,
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_EMULATE_PREPARES   => false,
         ]
     );
 
@@ -119,51 +115,63 @@ try {
 
     $snapshotAt = date('Y-m-d H:i:s');
 
+    // rank を含めた INSERT
     $insertSql = "
         INSERT INTO market_data (
             token_id,
             snapshot_at,
+            market_cap_rank,
             market_cap,
             volume_24h
         ) VALUES (
             :token_id,
             :snapshot_at,
+            :market_cap_rank,
             :market_cap,
             :volume_24h
         )
         ON DUPLICATE KEY UPDATE
-            market_cap = VALUES(market_cap),
-            volume_24h = VALUES(volume_24h)
+            market_cap_rank = VALUES(market_cap_rank),
+            market_cap      = VALUES(market_cap),
+            volume_24h      = VALUES(volume_24h)
     ";
 
     $insertStmt = $pdo->prepare($insertSql);
 
     $inserted = 0;
-    $skipped = 0;
-    $rankCount = 1;
+    $skipped  = 0;
 
     for ($page = 1; $page <= $pages; $page++) {
+
+        // ページに基づく順位開始値
+        $rankCount = ($page - 1) * $perPage + 1;
+
         $tokens = fetchTokens($page);
 
         foreach ($tokens as $token) {
             $tokenId = $token['id'];
-            // ランキング情報をWARNに出す対応
-            // APIから 'market_cap_rank' が取れる場合はそれを使用
-            // 取れない場合はループのカウント $rankCount を使用
-            $currentRank = $token['market_cap_rank'] ?? $rankCount;
+
+            // API順位を優先、なければ自前カウント
+            $currentRank = isset($token['market_cap_rank'])
+                ? (int)$token['market_cap_rank']
+                : $rankCount;
 
             if (!isset($existingTokens[$tokenId])) {
-                logMessage('WARN', "Rank #{$currentRank} | Token not found in tokens table: {$tokenId}");
+                logMessage(
+                    'WARN',
+                    "Rank #{$currentRank} | Token not found in tokens table: {$tokenId}"
+                );
                 $skipped++;
-                $rankCount++; // スキップしても順位（カウント）は進める
+                $rankCount++;
                 continue;
             }
 
             $insertStmt->execute([
-                ':token_id'    => $tokenId,
-                ':snapshot_at' => $snapshotAt,
-                ':market_cap'  => $token['market_cap'],
-                ':volume_24h'  => $token['total_volume'],
+                ':token_id'        => $tokenId,
+                ':snapshot_at'     => $snapshotAt,
+                ':market_cap_rank' => $currentRank,
+                ':market_cap'      => $token['market_cap'],
+                ':volume_24h'      => $token['total_volume'],
             ]);
 
             $inserted++;
